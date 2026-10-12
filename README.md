@@ -8,6 +8,8 @@ A Postgres-backed job queue: an HTTP API enqueues work, a pool of workers proces
 - **Retries:** exponential backoff with jitter, a dead-letter state, and `PermanentError` for failures retrying can't fix.
 - **Idempotent:** idempotency keys on enqueue, and an effects ledger (`ctx.once`) so a retry doesn't repeat a side effect an earlier attempt already performed.
 
+**[Live interactive demo](https://claude.ai/artifact/TkE9d6X9fN1dSYUsv5wVMV):** a narrated model of the queue. Kill and freeze workers, switch off fencing or the effects ledger, and watch which guarantees break.
+
 Read in this order: [SPEC.md](SPEC.md) (acceptance criteria, written first), then [DECISIONS.md](DECISIONS.md) (what was chosen, rejected, and corrected).
 
 ## Run it
@@ -72,6 +74,8 @@ TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/jobqueue_test py
 
 18 tests, one or more per acceptance criterion, about 5 seconds.
 
+Both run in CI on every push (`.github/workflows/tests.yml`) against a real Postgres 16.
+
 `python scripts/chaos_demo.py` runs the real thing: API server, two worker processes, 650 enqueue requests (150 of them duplicate retries), then `kill -9` on one worker mid-flight. Last run:
 
 ```
@@ -94,3 +98,7 @@ jobqueue/handlers.py  example handlers
 tests/                one test per acceptance criterion
 scripts/chaos_demo.py kill -9 end-to-end check
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
