@@ -1,5 +1,7 @@
 # Durable Job Queue
 
+[![A worker is killed mid-job. Its lease expires, another worker reclaims the job, and the email is not sent twice.](docs/demo.gif)](https://nav228.github.io/durable-job-queue/)
+
 A Postgres-backed job queue: an HTTP API enqueues work, a pool of workers processes it, and nothing is lost or double-applied when workers crash.
 
 - **Durable:** a job is committed before the API returns.
