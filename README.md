@@ -8,7 +8,7 @@ A Postgres-backed job queue: an HTTP API enqueues work, a pool of workers proces
 - **Retries:** exponential backoff with jitter, a dead-letter state, and `PermanentError` for failures retrying can't fix.
 - **Idempotent:** idempotency keys on enqueue, and an effects ledger (`ctx.once`) so a retry doesn't repeat a side effect an earlier attempt already performed.
 
-**[Live interactive demo](https://claude.ai/artifact/TkE9d6X9fN1dSYUsv5wVMV):** a narrated model of the queue. Kill and freeze workers, switch off fencing or the effects ledger, and watch which guarantees break.
+**[Live interactive demo](https://nav228.github.io/durable-job-queue/):** a narrated model of the queue. Kill and freeze workers, switch off fencing or the effects ledger, and watch which guarantees break.
 
 Read in this order: [SPEC.md](SPEC.md) (acceptance criteria, written first), then [DECISIONS.md](DECISIONS.md) (what was chosen, rejected, and corrected).
 

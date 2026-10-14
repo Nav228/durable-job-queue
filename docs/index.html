@@ -1,0 +1,871 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="Interactive model of a crash-safe Postgres job queue. Kill and freeze workers, switch off fencing or the effects ledger, and watch which guarantees break.">
+<meta property="og:title" content="Durable Job Queue">
+<meta property="og:description" content="Kill and freeze workers in a crash-safe Postgres job queue and watch nothing get lost or sent twice.">
+<meta property="og:type" content="website">
+<style>body{margin:0}img{max-width:100%}[hidden]{display:none!important}:root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}</style>
+<title>Durable Job Queue Live</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;700;800&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: header with proof strip, sticky narration bar, controls, three-stage pipeline (API, Postgres jobs table, worker pool), then checks / job inspector / event log, then the real code behind each mechanism. */
+:root {
+  --bg: #eef1f4; --surface: #ffffff; --ink: #15202b; --muted: #5a6876; --line: #d5dce3;
+  --accent: #2550cc; --accent-soft: #e3e9fb;
+  --q-bg: #fff2c7; --q-fg: #7a5a00; --r-bg: #e3e9fb; --r-fg: #1f45b3;
+  --s-bg: #dcf2e6; --s-fg: #17663f; --d-bg: #fbe1df; --d-fg: #a3241c;
+  --warn: #b45309; --warn-bg: #fdecd8; --code-bg: #f5f7f9;
+  --display: "Schibsted Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0e1419; --surface: #151d25; --ink: #e5ecf2; --muted: #93a3b2; --line: #26323d;
+  --accent: #82a0ff; --accent-soft: #1d2a4a;
+  --q-bg: #3a2f0c; --q-fg: #f2cf6b; --r-bg: #1d2a4a; --r-fg: #a9bdff;
+  --s-bg: #12321f; --s-fg: #7ad7a2; --d-bg: #3d1614; --d-fg: #ff9a92;
+  --warn: #f0a24a; --warn-bg: #3a2610; --code-bg: #0f161c;
+  color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #0e1419; --surface: #151d25; --ink: #e5ecf2; --muted: #93a3b2; --line: #26323d;
+  --accent: #82a0ff; --accent-soft: #1d2a4a;
+  --q-bg: #3a2f0c; --q-fg: #f2cf6b; --r-bg: #1d2a4a; --r-fg: #a9bdff;
+  --s-bg: #12321f; --s-fg: #7ad7a2; --d-bg: #3d1614; --d-fg: #ff9a92;
+  --warn: #f0a24a; --warn-bg: #3a2610; --code-bg: #0f161c;
+  color-scheme: dark; }
+
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font-family: var(--display); font-size: 15px; line-height: 1.5; }
+.wrap { max-width: 1240px; margin: 0 auto; padding-inline: 20px; padding-block: 28px 48px; display: grid; gap: 18px; }
+@media (max-width: 500px) { .wrap { padding-inline: 16px; } }
+.mono { font-family: var(--mono); }
+
+header { display: grid; gap: 10px; }
+h1 { font-size: clamp(28px, 4.4vw, 42px); font-weight: 800; letter-spacing: -0.025em; margin: 0; line-height: 1.1; text-wrap: balance; }
+.sub { color: var(--muted); margin: 0; max-width: 72ch; }
+.byline { font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; }
+.byline a { color: var(--accent); font-weight: 600; text-decoration: none; }
+.byline a:hover { text-decoration: underline; }
+.proof { display: flex; flex-wrap: wrap; gap: 8px; }
+.proof span { font: 12px var(--mono); padding: 5px 9px; border-radius: 5px; background: var(--surface); border: 1px solid var(--line); }
+.proof b { color: var(--s-fg); font-weight: 600; }
+
+.caption { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; background: var(--surface); border: 1px solid var(--line);
+  border-left: 4px solid var(--accent); border-radius: 8px; padding: 12px 14px; display: grid; gap: 4px; min-height: 76px;
+  box-shadow: 0 6px 18px -12px rgba(10, 20, 40, .35); }
+.caption.bad { border-left-color: var(--d-fg); }
+.caption.good { border-left-color: var(--s-fg); }
+.caption .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font: 600 11px var(--display); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.caption .slow { color: var(--warn); background: var(--warn-bg); padding: 1px 7px; border-radius: 99px; }
+.caption .replay { margin-left: auto; text-transform: none; letter-spacing: 0; padding: 4px 10px; font-size: 12px; color: var(--accent); }
+.caption p { margin: 0; font-size: 15px; max-width: 95ch; text-wrap: pretty; }
+
+.controls { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+.group { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.group .lbl { font: 600 11px var(--display); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-right: 2px; }
+button { font: 600 13px var(--display); color: var(--ink); background: var(--surface); border: 1px solid var(--line);
+  border-radius: 6px; padding: 7px 11px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button.primary { background: var(--accent); color: var(--surface); border-color: var(--accent); }
+button.danger { color: var(--d-fg); }
+button.toggle.on { color: var(--s-fg); }
+button.toggle.off { color: var(--d-fg); background: var(--d-bg); border-color: var(--d-fg); }
+.clock { margin-left: auto; font: 600 13px var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+
+.stage { display: grid; grid-template-columns: minmax(0, 0.75fr) minmax(0, 1.5fr) minmax(0, 1.15fr); gap: 14px; align-items: start; }
+.bottom { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.3fr); gap: 14px; align-items: start; }
+@media (max-width: 1000px) {
+  .stage, .bottom { grid-template-columns: minmax(0, 1fr); }
+  .p-api { order: 3; } .p-jobs { order: 1; } .p-workers { order: 2; }
+  .req:nth-child(n+5) { display: none; }
+}
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px; display: grid; gap: 10px; min-width: 0; align-content: start; }
+.panel h2 { margin: 0; font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted);
+  display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.panel h2 span { font-family: var(--mono); letter-spacing: 0; text-transform: none; font-weight: 400; }
+.hint { font-size: 12px; color: var(--muted); margin: 0; }
+
+.reqs { display: grid; gap: 6px; font: 12px/1.4 var(--mono); }
+.req { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; padding: 6px 8px; border-radius: 5px; background: var(--bg); }
+.req .code { font-weight: 600; }
+.req .c201 { color: var(--s-fg); } .req .c200 { color: var(--accent); }
+.req .what { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 10px; font-size: 12px; color: var(--muted); }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+.jobs { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 6px; }
+.job { font: 11px/1.35 var(--mono); padding: 6px 7px; border-radius: 5px; border: 1px solid transparent; min-width: 0;
+  text-align: left; cursor: pointer; color: inherit; background: none; transition: background-color .35s, color .35s; }
+.job b { font-weight: 600; font-size: 12px; }
+.job .meta { display: block; opacity: .85; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 400; }
+.job.empty { border: 1px dashed var(--line); color: var(--muted); cursor: default; opacity: .6; }
+.job.queued { background: var(--q-bg); color: var(--q-fg); }
+.job.waiting { background: transparent; color: var(--q-fg); border: 1px dashed var(--q-fg); }
+.job.running { background: var(--r-bg); color: var(--r-fg); border-color: var(--r-fg); }
+.job.succeeded { background: var(--s-bg); color: var(--s-fg); }
+.job.dead { background: var(--d-bg); color: var(--d-fg); }
+.job.flash { box-shadow: 0 0 0 2px var(--warn); }
+.job.sel { outline: 2px solid var(--ink); outline-offset: 1px; }
+.job.focus { box-shadow: 0 0 0 3px var(--accent); }
+.overflow { font: 12px var(--mono); color: var(--muted); }
+
+.workers { display: grid; gap: 8px; }
+.worker { border: 1px solid var(--line); border-radius: 6px; padding: 10px; display: grid; gap: 5px; transition: opacity .3s; }
+.worker.focus { box-shadow: 0 0 0 3px var(--accent); border-color: transparent; }
+.worker .top { display: flex; align-items: center; gap: 8px; font: 12px var(--mono); min-width: 0; }
+.worker .name { font-weight: 600; font-size: 13px; }
+.pill { font: 600 11px var(--display); text-transform: uppercase; letter-spacing: .06em; padding: 2px 7px; border-radius: 99px; }
+.pill.idle { background: var(--bg); color: var(--muted); }
+.pill.working { background: var(--r-bg); color: var(--r-fg); }
+.pill.crashed { background: var(--d-bg); color: var(--d-fg); }
+.pill.frozen { background: var(--q-bg); color: var(--q-fg); }
+.worker .job-on { margin-left: auto; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.bar { height: 6px; background: var(--bg); border-radius: 99px; overflow: hidden; }
+.bar > div { height: 100%; border-radius: 99px; }
+.bar .p { background: var(--accent); }
+.bar .l { background: var(--s-fg); }
+.bar .l.low { background: var(--d-fg); }
+.barlabel { display: flex; justify-content: space-between; font: 11px var(--mono); color: var(--muted); }
+.hb { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--line); flex: none; }
+.hb.beat { background: var(--s-fg); animation: beat .5s ease-out; }
+@keyframes beat { 0% { transform: scale(1.9); } 100% { transform: scale(1); } }
+.worker.dead-lane { opacity: .5; }
+
+.stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.stat { padding: 9px 10px; border-radius: 6px; background: var(--bg); display: grid; gap: 1px; }
+.stat .n { font: 600 21px var(--mono); font-variant-numeric: tabular-nums; }
+.stat .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.stat.good .n { color: var(--s-fg); } .stat.bad { background: var(--d-bg); } .stat.bad .n { color: var(--d-fg); }
+.checks { display: grid; gap: 7px; }
+.check { display: grid; grid-template-columns: 40px minmax(0, 1fr); gap: 8px; align-items: baseline; font-size: 13px; }
+.check .st { font: 600 11px var(--mono); text-align: center; padding: 1px 0; border-radius: 4px; }
+.check .st.ok { color: var(--s-fg); background: var(--s-bg); }
+.check .st.no { color: var(--d-fg); background: var(--d-bg); }
+.check small { display: block; color: var(--muted); font: 11px var(--mono); }
+
+.detail { display: grid; gap: 10px; font-size: 13px; }
+.detail .head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.detail .head b { font: 600 18px var(--mono); }
+.kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 3px 12px; font: 12px var(--mono); }
+.kv dt { color: var(--muted); } .kv dd { margin: 0; overflow-wrap: anywhere; }
+.hist { width: 100%; border-collapse: collapse; font: 12px var(--mono); }
+.hist th { text-align: left; font: 600 11px var(--display); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); padding: 4px 6px; border-bottom: 1px solid var(--line); }
+.hist td { padding: 5px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.hist .o-ok { color: var(--s-fg); } .hist .o-bad { color: var(--d-fg); } .hist .o-warn { color: var(--warn); } .hist .o-run { color: var(--r-fg); }
+.tablewrap { overflow-x: auto; }
+
+.logbar { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.logbar button { padding: 4px 9px; font-size: 12px; }
+.log { font: 12px/1.5 var(--mono); max-height: 360px; overflow-y: auto; display: grid; gap: 1px; align-content: start; }
+.log div { display: grid; grid-template-columns: 48px 58px minmax(0, 1fr); gap: 8px; padding: 3px 4px; border-radius: 3px; }
+.log .t { color: var(--muted); font-variant-numeric: tabular-nums; }
+.log .tag { font-weight: 600; }
+.log .tag.claim, .log .tag.start { color: var(--accent); }
+.log .tag.done, .log .tag.effect { color: var(--s-fg); }
+.log .tag.retry, .log .tag.reap { color: var(--warn); }
+.log .tag.dead, .log .tag.crash, .log .tag.fence, .log .tag.bug { color: var(--d-fg); }
+.log .tag.api { color: var(--muted); }
+.log .hl { background: var(--accent-soft); }
+.log .bugrow { background: var(--d-bg); }
+
+.hood { display: grid; gap: 12px; }
+.hood > h2 { margin: 8px 0 0; font-size: 22px; font-weight: 800; letter-spacing: -0.015em; }
+.hood > p { margin: 0; color: var(--muted); max-width: 72ch; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); gap: 12px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px; display: grid; gap: 8px; align-content: start; min-width: 0; }
+.card h3 { margin: 0; font-size: 16px; font-weight: 700; }
+.card p { margin: 0; font-size: 13px; color: var(--muted); }
+.card p b { color: var(--ink); font-weight: 600; }
+.card pre { margin: 0; background: var(--code-bg); border: 1px solid var(--line); border-radius: 6px; padding: 10px; overflow-x: auto;
+  font: 12px/1.55 var(--mono); }
+.card pre .k { color: var(--accent); font-weight: 600; } .card pre .c { color: var(--muted); }
+.card .file { font: 11px var(--mono); color: var(--muted); }
+.foot { color: var(--muted); font-size: 13px; max-width: 80ch; margin: 0; }
+.byline b { font-weight: 600; color: var(--ink); }
+.byline .links { display: inline-flex; gap: 12px; }
+.sitefoot { display: flex; flex-wrap: wrap; gap: 6px 16px; padding-top: 16px; border-top: 1px solid var(--line); font-size: 13px; color: var(--muted); }
+.sitefoot a { color: var(--accent); text-decoration: none; font-weight: 600; }
+.sitefoot a:hover { text-decoration: underline; }
+
+.flight { position: fixed; z-index: 20; width: 12px; height: 12px; margin: -6px 0 0 -6px; border-radius: 50%; background: var(--accent);
+  box-shadow: 0 0 0 4px var(--accent-soft); pointer-events: none; transition: transform .6s cubic-bezier(.4, .1, .2, 1), opacity .6s; }
+@media (prefers-reduced-motion: reduce) { .job, .worker, .hb.beat { animation: none; transition: none; } .flight { display: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Durable Job Queue</h1>
+    <p class="sub">An interactive model of a Postgres-backed job queue that survives worker crashes. Workers claim jobs with <span class="mono">FOR UPDATE SKIP LOCKED</span>, hold them under a heartbeated lease, get fenced out when they lose it, and record side effects so a retry never repeats them.</p>
+    <div class="byline"><span>By <b class="author">Kanav</b></span><span class="links" hidden></span><span>Python · FastAPI · PostgreSQL</span><span>October 2026</span></div>
+    <div class="proof">
+      <span><b>18/18</b> tests passing</span>
+      <span><b>17</b> acceptance criteria, spec written first</span>
+      <span>Chaos run: 500 jobs, kill -9 mid-run, <b>0 lost, 0 sent twice</b></span>
+    </div>
+  </header>
+
+  <div class="caption" id="caption" aria-live="polite">
+    <div class="row"><span id="capTag">Starting</span><span id="capStep"></span><span class="slow" id="capSlow" hidden>slow motion</span><button id="replay" class="replay" hidden>Replay tour</button></div>
+    <p id="capText"></p>
+  </div>
+
+  <div class="controls">
+    <div class="group">
+      <button id="play" class="primary">Pause</button>
+      <button id="speed">Speed 1x</button>
+      <button id="tour" class="toggle on">Guided tour: on</button>
+    </div>
+    <div class="group">
+      <span class="lbl">Break it</span>
+      <button id="kill" class="danger">kill -9 a worker</button>
+      <button id="stall" class="danger">Freeze a worker</button>
+      <button id="dup">Resend a request</button>
+      <button id="bad">Bad email</button>
+      <button id="burst">+10 jobs</button>
+    </div>
+    <div class="group">
+      <span class="lbl">Safety</span>
+      <button id="fencing" class="toggle on">Fencing: on</button>
+      <button id="ledger" class="toggle on">Effects ledger: on</button>
+    </div>
+    <button id="reset">Restart</button>
+    <span class="clock" id="clock">t = 0.0s</span>
+  </div>
+
+  <div class="stage">
+    <section class="panel p-api">
+      <h2>POST /jobs <span>API</span></h2>
+      <div class="reqs" id="reqs"></div>
+    </section>
+    <section class="panel p-jobs">
+      <h2>jobs table <span>Postgres</span></h2>
+      <div class="legend">
+        <span><i style="background:var(--q-bg);border:1px solid var(--q-fg)"></i>queued</span>
+        <span><i style="border:1px dashed var(--q-fg)"></i>backing off</span>
+        <span><i style="background:var(--r-bg);border:1px solid var(--r-fg)"></i>running</span>
+        <span><i style="background:var(--s-bg)"></i>succeeded</span>
+        <span><i style="background:var(--d-bg)"></i>dead</span>
+      </div>
+      <div class="jobs" id="jobs"></div>
+      <div class="overflow" id="overflow"></div>
+      <p class="hint">Click any job to inspect it below.</p>
+    </section>
+    <section class="panel p-workers">
+      <h2>Worker pool <span>lease 3s, heartbeat 1s</span></h2>
+      <div class="workers" id="workers"></div>
+    </section>
+  </div>
+
+  <div class="bottom">
+    <section class="panel">
+      <h2>Checks <span>run every tick</span></h2>
+      <div class="stats" id="stats"></div>
+      <div class="checks" id="checks"></div>
+    </section>
+    <section class="panel">
+      <h2><b id="detailId" style="font-weight:700">GET /jobs/{id}</b> <span>inspector</span></h2>
+      <div class="detail" id="detail"></div>
+    </section>
+    <section class="panel">
+      <div class="logbar"><h2 style="flex:1">Event log</h2><button id="logf">Showing: key events</button></div>
+      <div class="log" id="log"></div>
+    </section>
+  </div>
+
+  <section class="hood">
+    <h2>The real code behind each mechanism</h2>
+    <p>The page above is a browser model of the same rules. Here is what enforces them in the actual implementation, and the bug each one prevents.</p>
+    <div class="cards">
+      <article class="card">
+        <h3>Claiming without collisions</h3>
+        <p><b>Prevents:</b> two workers grabbing the same job. Locked rows are skipped instead of waited on, so a pool of workers claims in parallel.</p>
+<pre><span class="k">UPDATE</span> jobs <span class="k">SET</span> status = 'running',
+       attempts = attempts + 1,
+       lease_token = lease_token + 1,
+       locked_by = %(worker)s,
+       lease_expires_at = now() + %(lease)s
+<span class="k">WHERE</span> id = (<span class="k">SELECT</span> id <span class="k">FROM</span> jobs
+            <span class="k">WHERE</span> status = 'queued' <span class="k">AND</span> run_at &lt;= now()
+            <span class="k">ORDER BY</span> run_at, id
+            <span class="k">FOR UPDATE SKIP LOCKED LIMIT</span> 1)
+<span class="k">RETURNING</span> *;</pre>
+        <span class="file">jobqueue/store.py · claim()</span>
+      </article>
+      <article class="card">
+        <h3>Fencing stale workers</h3>
+        <p><b>Prevents:</b> a frozen worker waking up and overwriting the result of the worker that took over. Try turning fencing off and freezing a worker.</p>
+<pre><span class="k">UPDATE</span> jobs <span class="k">SET</span> status = 'succeeded', result = %(result)s
+<span class="k">WHERE</span> id = %(id)s
+  <span class="k">AND</span> status = 'running'
+  <span class="k">AND</span> locked_by = %(worker)s
+  <span class="k">AND</span> lease_token = %(token)s;
+<span class="c">-- 0 rows updated: we lost the lease, result discarded</span></pre>
+        <span class="file">jobqueue/store.py · complete(), fail(), heartbeat()</span>
+      </article>
+      <article class="card">
+        <h3>Recovering crashed workers</h3>
+        <p><b>Prevents:</b> jobs stuck in running forever after a crash. A lost lease counts as an attempt, so a job that keeps killing workers ends up dead instead of looping.</p>
+<pre><span class="k">UPDATE</span> jobs <span class="k">SET</span>
+  status = <span class="k">CASE WHEN</span> attempts &gt;= max_attempts
+           <span class="k">THEN</span> 'dead' <span class="k">ELSE</span> 'queued' <span class="k">END</span>,
+  last_error = 'lease expired'
+<span class="k">WHERE</span> status = 'running'
+  <span class="k">AND</span> lease_expires_at &lt; now();</pre>
+        <span class="file">jobqueue/store.py · reap_expired()</span>
+      </article>
+      <article class="card">
+        <h3>Not repeating side effects</h3>
+        <p><b>Prevents:</b> a retry sending the same email or charging the same card twice. Try turning the ledger off and killing a worker mid-email.</p>
+<pre><span class="k">def</span> once(self, name, fn):
+    found, result = store.get_effect(job.id, name)
+    <span class="k">if</span> found:
+        <span class="k">return</span> result   <span class="c"># an earlier attempt did it</span>
+    result = fn()
+    store.record_effect(job.id, name, result)
+    <span class="k">return</span> result</pre>
+        <span class="file">jobqueue/worker.py · JobContext.once()</span>
+      </article>
+      <article class="card">
+        <h3>Idempotent enqueue</h3>
+        <p><b>Prevents:</b> a client that retries after a timeout creating the same job twice. Same key returns the original job with a 200.</p>
+<pre><span class="k">INSERT INTO</span> jobs (type, payload, idempotency_key, ...)
+<span class="k">VALUES</span> (...)
+<span class="k">ON CONFLICT</span> (idempotency_key) <span class="k">DO NOTHING</span>
+<span class="k">RETURNING</span> *;
+<span class="c">-- no row back: return the existing job (200)</span></pre>
+        <span class="file">jobqueue/store.py · enqueue()</span>
+      </article>
+      <article class="card">
+        <h3>Proving it</h3>
+        <p><b>Spec first:</b> 17 acceptance criteria were written before any code, each with its own test. A chaos script then runs the real API and worker processes, sends 650 requests, and kills a worker with SIGKILL mid-run.</p>
+<pre>PASS 500 jobs stored (150 duplicate enqueues collapsed)
+PASS nothing left queued or running
+PASS 150 valid emails succeeded
+PASS one delivery record per email, none duplicated
+PASS 10 invalid emails dead-lettered without retries
+PASS jobs from the killed worker were reclaimed (6)</pre>
+        <span class="file">scripts/chaos_demo.py</span>
+      </article>
+    </div>
+  </section>
+
+  <p class="foot">The model uses a 3 second lease so you can watch it expire. The real default is 30 seconds. Each decision behind the design, including the ones that were wrong at first, is written up in DECISIONS.md in the repo.</p>
+  <footer class="sitefoot"><span>© 2026 <span class="author">Kanav</span></span><span class="links" hidden></span><span>MIT License</span></footer>
+</div>
+
+<script>
+// Author details shown in the byline and footer. Links stay hidden while empty.
+const AUTHOR = "Kanav";
+const REPO_URL = "https://github.com/Nav228/durable-job-queue";
+const LINKEDIN_URL = "";
+
+const LEASE = 3, HB = 1, REAP_EVERY = 2, DT = 0.1, MAX_ATT = 4, SLOTS = 20;
+const $ = (id) => document.getElementById(id);
+const rnd = (a, b) => a + Math.random() * (b - a);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const KEY_TAGS = new Set(["crash", "reap", "fence", "bug", "dead", "api", "start"]);
+let S, keyOnly = true;
+
+function fresh() {
+  const prev = S;
+  S = {
+    t: 0, speed: prev ? prev.speed : 1, playing: true,
+    tourOn: prev ? prev.tourOn : true, fencing: true, ledger: true,
+    all: new Map(), slots: Array(SLOTS).fill(null), nextId: 1, keySeq: 1,
+    keys: new Map(), keyCreates: new Map(), effects: new Map(), sends: new Map(),
+    counts: { queued: 0, running: 0, succeeded: 0, dead: 0 }, created: 0,
+    fencedRejects: 0, staleAccepted: 0, reclaimed: 0,
+    reqs: [], log: [], flash: new Map(), flights: [],
+    nextReap: 0, nextArrival: 0.4, focus: null, storyEndedAt: 0, selected: null,
+    caption: { tag: "Overview", text: "Four workers are pulling jobs from a Postgres table and heartbeating to keep their leases. A guided tour of four failure cases starts in a few seconds.", mood: "" },
+    workers: ["W1", "W2", "W3", "W4"].map((n) => ({ name: n, pid: 1, state: "idle", job: null, token: 0,
+      progress: 0, dur: 0, nextHb: 0, frozenUntil: 0, restartAt: 0, effectDone: false, beat: -9 })),
+    steps: [
+      { n: 1, ready: () => S.t >= 3, run: () => duplicate(true) },
+      { n: 2, ready: () => S.t >= 7 && quiet(), run: () => killScripted() },
+      { n: 3, ready: () => quiet(), run: () => freeze(true) },
+      { n: 4, ready: () => quiet(), run: () => enqueueBad(true) },
+      { n: 5, ready: () => quiet(), run: () => { S.tourDone = true; const green = checks().every((c) => c[0]); say("Tour complete", (green ? "All four failures were recovered and every check stayed green. " : "All four failures were handled. ") + "Use the controls below to cause your own, or switch off fencing or the effects ledger to see the bug each one prevents.", green ? "good" : ""); return true; } },
+    ],
+  };
+  ["email", "flaky", "email", "report", "flaky", "email", "flaky", "email"].forEach((t) => arrive(t));
+  syncButtons();
+}
+const quiet = () => !S.focus && S.t >= S.storyEndedAt + 2;
+const wid = (w) => `${w.name}.${w.pid}`;
+const validEmail = (j) => j.type === "email" && j.payload.to.includes("@");
+
+function say(tag, text, mood = "") { S.caption = { tag, text, mood }; }
+function addLog(tag, msg, cls = "") { S.log.unshift({ t: S.t, tag, msg, cls }); if (S.log.length > 120) S.log.pop(); }
+function addReq(code, what) { S.reqs.unshift({ code, what }); if (S.reqs.length > 9) S.reqs.pop(); }
+function flash(id) { S.flash.set(id, S.t + 1.5); }
+function setStatus(j, s) { S.counts[j.status]--; S.counts[s]++; j.status = s; }
+
+// ---------- jobs table (fixed slots so cards don't jump around) ----------
+function place(j) {
+  let i = S.slots.indexOf(null);
+  if (i < 0) {
+    let best = -1, bestId = Infinity;
+    S.slots.forEach((id, k) => {
+      const o = S.all.get(id);
+      const pinned = id === S.selected || (S.focus && S.focus.jobId === id);
+      if (o && (o.status === "succeeded" || o.status === "dead") && !pinned && id < bestId) { best = k; bestId = id; }
+    });
+    i = best;
+  }
+  if (i >= 0) { S.slots[i] = j.id; j.slotted = true; }
+}
+function placeOverflow() {
+  for (const j of S.all.values()) if (!j.slotted && j.status !== "succeeded" && j.status !== "dead") { place(j); if (!j.slotted) break; }
+}
+function prune() {
+  if (S.all.size <= 300) return;
+  const keep = new Set(S.slots);
+  for (const [id, j] of S.all) {
+    if (S.all.size <= 250) break;
+    if (!keep.has(id) && id !== S.selected && (j.status === "succeeded" || j.status === "dead")) S.all.delete(id);
+  }
+}
+
+// ---------- API ----------
+function enqueue(type, payload, key) {
+  if (key && S.keys.has(key)) {
+    const j = S.all.get(S.keys.get(key));
+    addReq(200, `key=${key} → existing #${S.keys.get(key)}`);
+    addLog("api", `POST /jobs key=${key}: 200, returned existing job #${S.keys.get(key)}, nothing inserted`, "hl");
+    if (j) flash(j.id);
+    return { job: j, created: false };
+  }
+  const j = { id: S.nextId++, type, payload, key, status: "queued", attempts: 0, runAt: S.t, lockedBy: null,
+    token: 0, leaseExp: 0, err: null, history: [], slotted: false, completions: 0 };
+  S.all.set(j.id, j); S.counts.queued++; S.created++;
+  if (key) { S.keys.set(key, j.id); S.keyCreates.set(key, (S.keyCreates.get(key) || 0) + 1); }
+  place(j);
+  addReq(201, `${type}${key ? " key=" + key : ""} → #${j.id}`);
+  return { job: j, created: true };
+}
+function arrive(kind) {
+  const r = Math.random();
+  const t = kind || (r < 0.45 ? "email" : r < 0.8 ? "flaky" : "report");
+  if (t === "email") { const n = S.keySeq++; enqueue("email", { to: `user${n}@acme.io` }, `welcome-${n}`); }
+  else enqueue(t, {});
+}
+
+// ---------- worker lifecycle ----------
+function owns(w, j) { return j.status === "running" && j.lockedBy === wid(w) && j.token === w.token; }
+function histEntry(j, token) { return j.history.find((h) => h.token === token); }
+
+function claim(w) {
+  let due = null;
+  for (const j of S.all.values()) if (j.status === "queued" && j.runAt <= S.t && (!due || j.runAt < due.runAt || (j.runAt === due.runAt && j.id < due.id))) due = j;
+  if (!due) return false;
+  setStatus(due, "running"); due.attempts++; due.token++; due.lockedBy = wid(w); due.leaseExp = S.t + LEASE;
+  due.history.push({ n: due.attempts, worker: wid(w), token: due.token, outcome: "running", cls: "o-run" });
+  if (!due.slotted) place(due);
+  w.job = due; w.token = due.token; w.state = "working"; w.progress = 0; w.effectDone = false; w.nextHb = S.t + HB;
+  w.dur = due.type === "report" ? rnd(3.5, 5.5) : due.type === "email" && !validEmail(due) ? 0.7 : rnd(1.4, 3);
+  S.flights.push({ id: due.id, w: w.name });
+  addLog("claim", `${wid(w)} claimed #${due.id} (${due.type}), attempt ${due.attempts}/${MAX_ATT}, lease_token=${due.token}`);
+  story(due.id, "claim", { w, token: due.token });
+  return true;
+}
+
+function reap() {
+  let n = 0;
+  for (const j of S.all.values()) {
+    if (j.status !== "running" || j.leaseExp >= S.t) continue;
+    n++; S.reclaimed++;
+    const dead = j.attempts >= MAX_ATT, who = j.lockedBy;
+    const h = histEntry(j, j.token); if (h) { h.outcome = "lease expired"; h.cls = "o-warn"; }
+    setStatus(j, dead ? "dead" : "queued"); j.runAt = S.t; j.err = `lease expired (${who} stopped responding)`; j.lockedBy = null;
+    addLog("reap", `lease on #${j.id} expired, ${who} stopped responding → ${dead ? "dead" : "back to queued"}`, "hl");
+    flash(j.id);
+    story(j.id, "reap", { who });
+  }
+  return n;
+}
+
+function finish(w, ok, err, permanent) {
+  const j = w.job;
+  const own = owns(w, j);
+  w.job = null; w.state = "idle";
+  if (!own && S.fencing) {
+    S.fencedRejects++;
+    const h = histEntry(j, w.token); if (h) { h.outcome = "late write rejected"; h.cls = "o-bad"; }
+    addLog("fence", `${wid(w)} tried to mark #${j.id} ${ok ? "succeeded" : "failed"} with lease_token ${w.token}, but the job is on token ${j.token}: 0 rows updated`, "hl");
+    flash(j.id);
+    story(j.id, "fence", { w, old: w.token, cur: j.token });
+    return;
+  }
+  if (!own) {
+    S.staleAccepted++;
+    const h = histEntry(j, w.token); if (h) { h.outcome = "stale write ACCEPTED"; h.cls = "o-bad"; }
+    addLog("bug", `fencing is off: ${wid(w)} no longer owns #${j.id} but its write was accepted`, "bugrow");
+    story(j.id, "stale", { w });
+  }
+  const h = own ? histEntry(j, w.token) : null;
+  j.lockedBy = null;
+  if (ok) {
+    j.completions++;
+    if (j.status !== "succeeded") setStatus(j, "succeeded");
+    j.err = null;
+    if (h) { h.outcome = "succeeded"; h.cls = "o-ok"; }
+    addLog("done", `#${j.id} succeeded on attempt ${j.attempts}`);
+    story(j.id, "done", {});
+  } else {
+    const dead = permanent || j.attempts >= MAX_ATT;
+    j.err = err;
+    if (dead) {
+      setStatus(j, "dead");
+      if (h) { h.outcome = permanent ? "PermanentError → dead" : "failed → dead"; h.cls = "o-bad"; }
+      addLog("dead", `#${j.id} ${permanent ? "raised PermanentError" : "is out of attempts"} (${err}) → dead`, "hl");
+      story(j.id, "dead", { permanent });
+    } else {
+      const delay = rnd(0.5, Math.min(8, 1.5 * 2 ** (j.attempts - 1)) + 0.5);
+      setStatus(j, "queued"); j.runAt = S.t + delay;
+      if (h) { h.outcome = `failed, retry in ${delay.toFixed(1)}s`; h.cls = "o-warn"; }
+      addLog("retry", `#${j.id} failed (${err}), retrying in ${delay.toFixed(1)}s with jittered backoff`);
+      story(j.id, "retry", { delay });
+    }
+  }
+}
+
+function stepWorker(w) {
+  if (w.state === "crashed") {
+    if (S.t >= w.restartAt) { w.pid++; w.state = "idle"; addLog("start", `supervisor restarted the worker as ${wid(w)}`); }
+    return;
+  }
+  if (w.state === "frozen") {
+    if (S.t >= w.frozenUntil) {
+      w.state = "working";
+      addLog("crash", `${wid(w)} woke up and still thinks it owns #${w.job.id}`);
+      finish(w, true);
+    }
+    return;
+  }
+  if (w.state === "idle") { if (!claim(w) && reap()) claim(w); return; }
+
+  const j = w.job;
+  w.progress += DT;
+  if (S.t >= w.nextHb) {
+    w.nextHb = S.t + HB;
+    if (owns(w, j)) { j.leaseExp = S.t + LEASE; w.beat = S.t; }
+  }
+  if (validEmail(j) && !w.effectDone && w.progress >= w.dur * 0.5) {
+    w.effectDone = true;
+    if (S.ledger && S.effects.has(j.id)) {
+      const n = S.effects.get(j.id);
+      addLog("effect", `ctx.once("deliver") on #${j.id}: found the record from attempt ${n}, skipped sending`, "hl");
+      story(j.id, "skip", { n });
+    } else {
+      const again = S.sends.has(j.id);
+      S.effects.set(j.id, j.attempts); S.sends.set(j.id, (S.sends.get(j.id) || 0) + 1);
+      if (again) { addLog("bug", `effects ledger is off: #${j.id} sent the email to ${j.payload.to} AGAIN`, "bugrow"); story(j.id, "resent", { n: j.attempts }); }
+      else addLog("effect", `#${j.id} sent email to ${j.payload.to}, recorded in job_effects`);
+    }
+  }
+  if (w.progress >= w.dur) {
+    if (j.type === "email" && !validEmail(j)) finish(w, false, "invalid recipient", true);
+    else if (j.type === "flaky" && Math.random() < 0.4) finish(w, false, "upstream timeout");
+    else finish(w, true);
+  }
+}
+
+// ---------- failure injection ----------
+function busy() { return S.workers.filter((w) => w.state === "working"); }
+function nobody(what) { say("Nothing to " + what, "No worker is busy right now. Give it a second and try again.", ""); }
+
+function killWorker(w, scripted) {
+  const j = w.job, sent = w.effectDone && validEmail(j);
+  addLog("crash", `kill -9 ${wid(w)} while it held #${j.id}${sent ? " (email already sent)" : ""}; the row still says running`, "hl");
+  w.state = "crashed"; w.restartAt = S.t + 5; w.job = null;
+  startStory("kill", j.id, w, scripted,
+    `kill -9 on ${wid(w)} while it held #${j.id}${sent ? ", right after it sent the email" : ""}. In Postgres the job still says running and its lease is draining. Nobody else can take it until the lease runs out.`,
+    { sent });
+}
+function killScripted() {
+  const b = busy();
+  const ready = b.find((w) => w.effectDone && validEmail(w.job));
+  if (ready) { killWorker(ready, true); return true; }
+  if (S.t < 16 || !b.length) return false;
+  killWorker(b.sort((x, y) => y.progress - x.progress)[0], true); return true;
+}
+function killManual() {
+  const b = busy(); if (!b.length) return nobody("kill");
+  killWorker(b.find((w) => w.effectDone && validEmail(w.job)) || b.sort((x, y) => y.progress - x.progress)[0], false);
+}
+function freeze(scripted) {
+  const b = busy();
+  if (!b.length) { if (!scripted) nobody("freeze"); return false; }
+  const w = b.sort((x, y) => (x.progress / x.dur) - (y.progress / y.dur))[0];
+  w.state = "frozen"; w.frozenUntil = S.t + LEASE + 4;
+  addLog("crash", `${wid(w)} froze while holding #${w.job.id}; heartbeats stop`, "hl");
+  startStory("freeze", w.job.id, w, scripted,
+    `${wid(w)} froze while holding #${w.job.id}, like a long GC pause or a network blip. It isn't dead. It will wake up later still thinking it owns the job.`);
+  return true;
+}
+function duplicate(scripted) {
+  const ids = [...S.keys.values()].filter((id) => S.all.has(id)).slice(-6);
+  if (!ids.length) { if (!scripted) nobody("resend"); return false; }
+  const j = S.all.get(ids[Math.floor(Math.random() * ids.length)]);
+  enqueue(j.type, j.payload, j.key);
+  startStory("dup", j.id, null, scripted,
+    `A client timed out and resent POST /jobs with key ${j.key}. The unique index caught it, so the API returned the existing job #${j.id} with a 200 instead of inserting a second one.`);
+  if (S.focus && S.focus.kind === "dup") S.focus.endAt = S.t + 4;
+  return true;
+}
+function enqueueBad(scripted) {
+  const n = S.keySeq++;
+  const { job } = enqueue("email", { to: "not-an-email" }, `welcome-${n}`);
+  startStory("bad", job.id, null, scripted,
+    `#${job.id} has an invalid email address. When a worker picks it up, the handler raises PermanentError, so it goes straight to dead instead of burning ${MAX_ATT} retries.`);
+  return true;
+}
+
+// ---------- narration ----------
+function startStory(kind, jobId, w, scripted, text, extra = {}) {
+  const step = scripted ? S.steps.length ? S.steps[0].n : null : null;
+  const tag = { kill: "Worker crash", freeze: "Frozen worker", dup: "Duplicate request", bad: "Bad input" }[kind];
+  if (!S.focus || scripted) S.focus = { kind, jobId, worker: w ? w.name : null, step, endAt: null, ...extra };
+  else if (S.focus.jobId !== jobId) { say(tag, text); return; }
+  say(tag, text);
+}
+function story(id, ev, d) {
+  const f = S.focus;
+  if (!f || f.jobId !== id) {
+    if (ev === "stale") say("Fencing is off", `${wid(d.w)} wrote to #${id} after losing it, and the write was accepted. That's the bug fencing prevents.`, "bad");
+    if (ev === "resent") say("Ledger is off", `#${id} sent its email again on attempt ${d.n}. The customer got it twice. That's the bug the effects ledger prevents.`, "bad");
+    return;
+  }
+  if (f.endAt !== null) return; // story already resolved, hold the final caption
+  const end = (s = 3) => { f.endAt = S.t + s; };
+  const tag = S.caption.tag;
+  if (f.kind === "kill") {
+    if (ev === "reap") say(tag, `#${id}'s lease ran out. The reaper moved it back to queued and counted the lost attempt.`);
+    if (ev === "claim") { f.worker = d.w.name; say(tag, `${wid(d.w)} claimed #${id} with lease_token ${d.token}. Token ${d.token - 1}, held by the dead worker, is now worthless.`); }
+    if (ev === "skip") say(tag, `ctx.once("deliver") found the email record from attempt ${d.n} and skipped sending. The customer still gets exactly one email.`, "good");
+    if (ev === "resent") say("Ledger is off", `The retry sent the email again. The customer got it twice. That's the bug the effects ledger prevents.`, "bad");
+    if (ev === "retry") say(tag, `#${id} hit an ordinary error on this attempt and will retry after a jittered backoff.`);
+    if (ev === "done") { say(tag, `#${id} succeeded on attempt ${S.all.get(id).attempts}. The crash was recovered${f.sent ? (S.ledger ? " with nothing lost and nothing sent twice" : ", but the email went out twice") : " with nothing lost"}.`, f.sent && !S.ledger ? "bad" : "good"); end(); }
+    if (ev === "dead") { say(tag, `#${id} ran out of attempts and is dead, with its error saved for debugging.`); end(); }
+  } else if (f.kind === "freeze") {
+    if (ev === "reap") say(tag, `${d.who} missed its heartbeats, so the lease on #${id} expired and the reaper requeued it. ${d.who} is still frozen.`);
+    if (ev === "claim") say(tag, `${wid(d.w)} now owns #${id} with lease_token ${d.token}. The frozen worker still holds token ${d.token - 1}.`);
+    if (ev === "fence") { say(tag, `${wid(d.w)} woke up and tried to mark #${id} succeeded with token ${d.old}. The UPDATE requires token ${d.cur}, so it matched 0 rows and the stale write was thrown away.`, "good"); end(4); }
+    if (ev === "stale") { say("Fencing is off", `${wid(d.w)} woke up and its stale write was accepted, overwriting #${id} while another worker owned it. That's the bug fencing prevents.`, "bad"); end(4); }
+  } else if (f.kind === "bad") {
+    if (ev === "claim") say(tag, `${wid(d.w)} picked up #${id}. The handler checks the address first.`);
+    if (ev === "dead") { say(tag, `#${id} is dead after 1 attempt, with the error saved. Once the input is fixed, POST /jobs/${id}/retry puts it back in the queue.`, "good"); end(); }
+  }
+}
+
+// ---------- checks ----------
+function checks() {
+  const sum = S.counts.queued + S.counts.running + S.counts.succeeded + S.counts.dead;
+  const dupKeys = [...S.keyCreates.values()].filter((n) => n > 1).length;
+  const twice = [...S.sends.values()].filter((n) => n > 1).length;
+  let stuck = 0;
+  for (const j of S.all.values()) if (j.status === "running" && j.leaseExp < S.t - (REAP_EVERY + 0.5)) stuck++;
+  return [
+    [sum === S.created, "No job lost", `${S.created} accepted, ${sum} accounted for`],
+    [dupKeys === 0, "One job per idempotency key", `${S.keys.size} keys, ${dupKeys} with duplicates`],
+    [twice === 0, "No email sent twice", `${S.sends.size} sent, ${twice} duplicated, ${S.reclaimed} leases reclaimed`],
+    [S.staleAccepted === 0, "No write accepted from a worker that lost its job", `${S.fencedRejects} rejected, ${S.staleAccepted} accepted`],
+    [stuck === 0, "No job stuck after its lease expired", `${stuck} past lease plus reaper interval`],
+  ];
+}
+
+// ---------- tick ----------
+function tick() {
+  S.t += DT;
+  if (S.tourOn && S.steps.length && S.steps[0].ready() && S.steps[0].run() !== false) S.steps.shift();
+  if (S.focus && S.focus.endAt !== null && S.t >= S.focus.endAt) { S.focus = null; S.storyEndedAt = S.t; }
+  if (S.t >= S.nextArrival) {
+    if (S.counts.queued < 9) arrive();
+    S.nextArrival = S.t + rnd(0.5, 1.2);
+  }
+  if (S.t >= S.nextReap) { reap(); S.nextReap = S.t + REAP_EVERY; }
+  for (const w of S.workers) stepWorker(w);
+  placeOverflow(); prune();
+}
+
+// ---------- render ----------
+function render() {
+  $("clock").textContent = "t = " + S.t.toFixed(1) + "s";
+  const c = S.caption, slow = slowMo();
+  $("caption").className = "caption" + (c.mood ? " " + c.mood : "");
+  $("capTag").textContent = c.tag;
+  $("capStep").textContent = S.focus && S.focus.step && S.focus.step <= 4 ? `· Tour ${S.focus.step} of 4` : "";
+  $("capSlow").hidden = !slow;
+  $("replay").hidden = !S.tourDone;
+  $("capText").textContent = c.text;
+
+  $("reqs").innerHTML = S.reqs.map((r) => `<div class="req"><span class="code c${r.code}">${r.code}</span><span class="what">${esc(r.what)}</span></div>`).join("");
+
+  const fid = S.focus ? S.focus.jobId : null;
+  $("jobs").innerHTML = S.slots.map((id) => {
+    const j = id && S.all.get(id);
+    if (!j) return `<div class="job empty"><b>&nbsp;</b><span class="meta">empty</span></div>`;
+    let cls = j.status, meta;
+    if (j.status === "queued" && j.runAt > S.t) { cls = "waiting"; meta = `retry in ${(j.runAt - S.t).toFixed(1)}s`; }
+    else if (j.status === "running") meta = j.lockedBy;
+    else if (j.status === "dead") meta = j.err && j.err.startsWith("lease") ? "lease expired" : j.err || "dead";
+    else if (j.status === "succeeded") meta = "done";
+    else meta = "queued";
+    const extra = ((S.flash.get(j.id) || 0) > S.t ? " flash" : "") + (j.id === S.selected ? " sel" : "") + (j.id === fid ? " focus" : "");
+    return `<button class="job ${cls}${extra}" data-job="${j.id}" aria-label="Inspect job ${j.id}"><b>#${j.id}</b> ${j.type}<span class="meta">a${j.attempts}/${MAX_ATT} · ${esc(meta)}</span></button>`;
+  }).join("");
+  const off = [...S.all.values()].filter((j) => !j.slotted && j.status === "queued").length;
+  $("overflow").textContent = off ? `+${off} more queued, not shown` : "";
+
+  $("workers").innerHTML = S.workers.map((w) => {
+    const j = w.job;
+    let lease = 0, leaseTxt = "", prog = 0, on = "idle, polling";
+    if (j) {
+      prog = Math.min(1, w.progress / w.dur);
+      const owned = j.lockedBy === wid(w) && j.token === w.token && j.status === "running";
+      lease = owned ? Math.max(0, (j.leaseExp - S.t) / LEASE) : 0;
+      leaseTxt = owned ? Math.max(0, j.leaseExp - S.t).toFixed(1) + "s left" : "lost";
+      on = `#${j.id} ${j.type} · token ${w.token}`;
+    }
+    if (w.state === "crashed") on = `restarting in ${Math.max(0, w.restartAt - S.t).toFixed(1)}s`;
+    if (w.state === "frozen") on = `frozen, ${Math.max(0, w.frozenUntil - S.t).toFixed(1)}s · holds #${j.id}`;
+    const beat = S.t - w.beat < 0.3 ? " beat" : "";
+    const focus = S.focus && S.focus.worker === w.name ? " focus" : "";
+    return `<div class="worker${w.state === "crashed" ? " dead-lane" : ""}${focus}" data-worker="${w.name}">
+      <div class="top"><span class="name">${wid(w)}</span><span class="pill ${w.state}">${w.state}</span><span class="hb${beat}" title="heartbeat"></span><span class="job-on">${esc(on)}</span></div>
+      <div class="barlabel"><span>progress</span><span>${j ? Math.round(prog * 100) + "%" : ""}</span></div>
+      <div class="bar"><div class="p" style="width:${prog * 100}%"></div></div>
+      <div class="barlabel"><span>lease</span><span>${leaseTxt}</span></div>
+      <div class="bar"><div class="l${lease < 0.4 ? " low" : ""}" style="width:${lease * 100}%"></div></div>
+    </div>`;
+  }).join("");
+
+  const twice = [...S.sends.values()].filter((n) => n > 1).length;
+  $("stats").innerHTML = [
+    ["queued", S.counts.queued, ""], ["running", S.counts.running, ""], ["succeeded", S.counts.succeeded, "good"],
+    ["dead", S.counts.dead, ""], ["emails sent", S.sends.size, ""], ["sent twice", twice, twice ? "bad" : "good"],
+  ].map(([k, n, cls]) => `<div class="stat ${cls}"><span class="n">${n}</span><span class="k">${k}</span></div>`).join("");
+  $("checks").innerHTML = checks().map(([ok, name, d]) =>
+    `<div class="check"><span class="st ${ok ? "ok" : "no"}">${ok ? "PASS" : "FAIL"}</span><span>${esc(name)}<small>${esc(d)}</small></span></div>`).join("");
+
+  renderDetail();
+
+  const rows = keyOnly ? S.log.filter((l) => KEY_TAGS.has(l.tag) || l.cls) : S.log;
+  $("log").innerHTML = rows.slice(0, 80).map((l) => `<div class="${l.cls}"><span class="t">${l.t.toFixed(1)}s</span><span class="tag ${l.tag}">${l.tag}</span><span>${esc(l.msg)}</span></div>`).join("")
+    || `<div><span></span><span></span><span class="t">Key events will appear here.</span></div>`;
+
+  flyAll();
+}
+
+function pickDetail() {
+  if (S.selected && S.all.has(S.selected)) return S.all.get(S.selected);
+  if (S.focus && S.all.has(S.focus.jobId)) return S.all.get(S.focus.jobId);
+  const running = [...S.all.values()].filter((j) => j.status === "running");
+  return running[running.length - 1] || [...S.all.values()].pop();
+}
+function renderDetail() {
+  const j = pickDetail();
+  if (!j) { $("detail").innerHTML = ""; return; }
+  $("detailId").textContent = `GET /jobs/${j.id}`;
+  const statusCls = { queued: "o-warn", running: "o-run", succeeded: "o-ok", dead: "o-bad" }[j.status];
+  const eff = S.effects.has(j.id) ? `deliver, recorded on attempt ${S.effects.get(j.id)}${(S.sends.get(j.id) || 0) > 1 ? `, sent ${S.sends.get(j.id)} times` : ""}` : j.type === "email" ? "none yet" : "none (no side effects)";
+  const how = S.selected === j.id ? "" : S.focus && S.focus.jobId === j.id ? " · following the story" : " · latest running job";
+  $("detail").innerHTML = `
+    <div class="head"><b>#${j.id}</b><span class="mono">${j.type}</span><span class="mono ${statusCls}" style="font-weight:600">${j.status}</span><span class="hint">${how}</span></div>
+    <dl class="kv">
+      ${j.key ? `<dt>idempotency_key</dt><dd>${esc(j.key)}</dd>` : ""}
+      <dt>payload</dt><dd>${esc(JSON.stringify(j.payload))}</dd>
+      <dt>attempts</dt><dd>${j.attempts} of ${j.status === "dead" && j.err === "invalid recipient" ? j.attempts + " (permanent)" : MAX_ATT}</dd>
+      <dt>lease_token</dt><dd>${j.token}</dd>
+      ${j.lockedBy ? `<dt>locked_by</dt><dd>${esc(j.lockedBy)}</dd>` : ""}
+      ${j.err ? `<dt>last_error</dt><dd>${esc(j.err)}</dd>` : ""}
+      <dt>effects</dt><dd>${esc(eff)}</dd>
+    </dl>
+    <div class="tablewrap"><table class="hist"><thead><tr><th>Try</th><th>Worker</th><th>Token</th><th>Outcome</th></tr></thead><tbody>
+      ${j.history.map((h) => `<tr><td>${h.n}</td><td>${esc(h.worker)}</td><td>${h.token}</td><td class="${h.cls}">${esc(h.outcome)}</td></tr>`).join("") || `<tr><td colspan="4" style="color:var(--muted)">Not claimed yet</td></tr>`}
+    </tbody></table></div>`;
+}
+
+const reduceMotion = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : { matches: false };
+function flyAll() {
+  const list = S.flights; S.flights = [];
+  if (reduceMotion.matches || !document.querySelector) return;
+  for (const f of list) {
+    const a = document.querySelector(`[data-job="${f.id}"]`), b = document.querySelector(`[data-worker="${f.w}"]`);
+    if (!a || !b) continue;
+    const r1 = a.getBoundingClientRect(), r2 = b.getBoundingClientRect();
+    const x1 = r1.left + r1.width / 2, y1 = r1.top + r1.height / 2, x2 = r2.left + 18, y2 = r2.top + 18;
+    if (Math.hypot(x2 - x1, y2 - y1) > 900) continue;
+    const dot = document.createElement("div");
+    dot.className = "flight"; dot.style.left = x1 + "px"; dot.style.top = y1 + "px";
+    document.body.appendChild(dot);
+    requestAnimationFrame(() => requestAnimationFrame(() => { dot.style.transform = `translate(${x2 - x1}px, ${y2 - y1}px)`; dot.style.opacity = "0.2"; }));
+    setTimeout(() => dot.remove(), 700);
+  }
+}
+
+// ---------- loop & controls ----------
+const slowMo = () => S.tourOn && S.focus && S.focus.kind !== "dup";
+let acc = 0, last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.25, (now - last) / 1000); last = now;
+  let ticked = false;
+  if (S.playing) { acc += dt * S.speed * (slowMo() ? 0.5 : 1); while (acc >= DT) { tick(); acc -= DT; ticked = true; } }
+  if (ticked) render();
+  requestAnimationFrame(loop);
+}
+function syncButtons() {
+  const set = (id, on, label) => { const b = $(id); b.textContent = `${label}: ${on ? "on" : "off"}`; b.className = "toggle " + (on ? "on" : "off"); };
+  set("tour", S.tourOn, "Guided tour"); set("fencing", S.fencing, "Fencing"); set("ledger", S.ledger, "Effects ledger");
+  $("play").textContent = S.playing ? "Pause" : "Play";
+  $("speed").textContent = `Speed ${S.speed}x`;
+  $("logf").textContent = keyOnly ? "Showing: key events" : "Showing: everything";
+}
+
+$("play").onclick = () => { S.playing = !S.playing; syncButtons(); };
+$("speed").onclick = () => { S.speed = S.speed === 1 ? 2 : S.speed === 2 ? 0.5 : 1; syncButtons(); };
+$("tour").onclick = () => { S.tourOn = !S.tourOn; if (!S.tourOn) S.steps = []; syncButtons(); render(); };
+$("kill").onclick = () => { killManual(); render(); };
+$("stall").onclick = () => { freeze(false); render(); };
+$("dup").onclick = () => { duplicate(false); render(); };
+$("bad").onclick = () => { enqueueBad(false); render(); };
+$("burst").onclick = () => { for (let i = 0; i < 10; i++) arrive(); render(); };
+$("fencing").onclick = () => {
+  S.fencing = !S.fencing; syncButtons();
+  say(S.fencing ? "Fencing back on" : "Fencing is off", S.fencing ? "Writes are checked against the lease token again." : "Workers can now write to jobs they no longer own. Freeze a worker and watch the stale-write check fail.", S.fencing ? "good" : "bad");
+  render();
+};
+$("ledger").onclick = () => {
+  S.ledger = !S.ledger; syncButtons();
+  say(S.ledger ? "Ledger back on" : "Effects ledger is off", S.ledger ? "Retries check job_effects before sending again." : "Retries no longer check whether the email was already sent. Kill a worker mid-email and watch the duplicate-email check fail.", S.ledger ? "good" : "bad");
+  render();
+};
+$("reset").onclick = () => { fresh(); acc = 0; render(); };
+$("logf").onclick = () => { keyOnly = !keyOnly; syncButtons(); render(); };
+$("jobs").addEventListener("click", (e) => {
+  const el = e.target.closest ? e.target.closest("[data-job]") : null;
+  if (!el) return;
+  const id = Number(el.dataset.job);
+  S.selected = S.selected === id ? null : id;
+  render();
+});
+
+$("replay").onclick = () => { S.tourOn = true; fresh(); acc = 0; render(); };
+document.querySelectorAll(".author").forEach((el) => { el.textContent = AUTHOR; });
+const LINKS = [[REPO_URL, "Source on GitHub"], [LINKEDIN_URL, "LinkedIn"]].filter(([u]) => u);
+if (LINKS.length) document.querySelectorAll(".links").forEach((el) => {
+  el.innerHTML = LINKS.map(([u, t]) => `<a href="${esc(u)}" target="_blank" rel="noopener">${t}</a>`).join("");
+  el.hidden = false;
+});
+fresh();
+render();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
